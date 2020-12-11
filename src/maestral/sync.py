@@ -1532,8 +1532,6 @@ class SyncEngine:
         :returns: (list of sync times events, time_stamp)
         """
 
-        self.ensure_dropbox_folder_present()
-
         try:
             events = [self.fs_events.local_file_event_queue.get(timeout=timeout)]
             local_cursor = time.time()
@@ -2041,6 +2039,9 @@ class SyncEngine:
         :raises MaestralApiError: For any issues when syncing the item.
         """
 
+        if event.local_path_from == self.dropbox_path:
+            self.ensure_dropbox_folder_present()
+
         # fail fast on badly decoded paths
         validate_encoding(event.local_path)
 
@@ -2296,6 +2297,9 @@ class SyncEngine:
         :returns: Metadata for deleted item or None if no remote item is deleted.
         :raises MaestralApiError: For any issues when syncing the item.
         """
+
+        if event.local_path == self.dropbox_path:
+            self.ensure_dropbox_folder_present()
 
         if self.is_excluded_by_user(event.dbx_path):
             logger.debug(
