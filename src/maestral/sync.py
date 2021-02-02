@@ -10,19 +10,19 @@ import socket
 import resource
 import logging
 import time
-import tempfile
 import random
 import uuid
 import urllib.parse
+import enum
+import pprint
+import gc
 from threading import Thread, Event, RLock, current_thread
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from collections import abc
 from contextlib import contextmanager
-import enum
-import pprint
-import gc
 from functools import wraps
+from tempfile import NamedTemporaryFile
 from typing import (
     Optional,
     Any,
@@ -50,7 +50,12 @@ import pathspec  # type: ignore
 import dropbox  # type: ignore
 from dropbox.files import Metadata, DeletedMetadata, FileMetadata, FolderMetadata  # type: ignore
 from watchdog.events import FileSystemEventHandler  # type: ignore
-from watchdog.events import EVENT_TYPE_CREATED, EVENT_TYPE_DELETED, EVENT_TYPE_MOVED
+from watchdog.events import (
+    EVENT_TYPE_CREATED,
+    EVENT_TYPE_DELETED,
+    EVENT_TYPE_MOVED,
+    EVENT_TYPE_MODIFIED,
+)
 from watchdog.events import (
     DirModifiedEvent,
     FileModifiedEvent,
@@ -65,8 +70,8 @@ from watchdog.events import (
 from watchdog.utils.dirsnapshot import DirectorySnapshot  # type: ignore
 
 # local imports
+from . import notify
 from .config import MaestralConfig, MaestralState
-from .notify import MaestralDesktopNotifier
 from .fsevents import Observer
 from .constants import (
     IDLE,
@@ -144,7 +149,9 @@ __all__ = [
 
 
 logger = logging.getLogger(__name__)
-_cpu_count = os.cpu_count() or 1  # os.cpu_count can return None
+cpu_count = os.cpu_count() or 1  # os.cpu_count can return None
+umask = os.umask(0o22)
+os.umask(umask)
 
 # type definitions
 ExecInfoType = Tuple[Type[BaseException], BaseException, Optional[TracebackType]]
@@ -186,8 +193,16 @@ class FSEventHandler(FileSystemEventHandler):
     to be uploaded by :meth:`upload_worker`. This acts as a translation layer between
     :class:`watchdog.Observer` and :class:`SyncEngine`.
 
+    White lists of event types to handle are supplied as ``file_event_types`` and
+    ``dir_event_types``. This is for forward compatibility as additional event types
+    may be added to watchdog in the future.
+
     :param syncing: Set when syncing is running.
     :param startup: Set when startup is running.
+    :param file_event_types: Types of file events to handle. This acts as a whitelist.
+        By default, only FileClosedEvents are ignored.
+    :param dir_event_types: Types of directory events to handle. This acts as a
+        whitelist. By default, only DirModifiedEvents are ignored.
 
     :cvar float ignore_timeout: Timeout in seconds after which ignored paths will be
         discarded.
@@ -196,10 +211,28 @@ class FSEventHandler(FileSystemEventHandler):
     _ignored_events: List[_Ignore]
     local_file_event_queue: "Queue[FileSystemEvent]"
 
-    def __init__(self, syncing: Event, startup: Event) -> None:
+    def __init__(
+        self,
+        syncing: Event,
+        startup: Event,
+        file_event_types: Tuple[str, ...] = (
+            EVENT_TYPE_CREATED,
+            EVENT_TYPE_DELETED,
+            EVENT_TYPE_MODIFIED,
+            EVENT_TYPE_MOVED,
+        ),
+        dir_event_types: Tuple[str, ...] = (
+            EVENT_TYPE_CREATED,
+            EVENT_TYPE_DELETED,
+            EVENT_TYPE_MOVED,
+        ),
+    ) -> None:
 
         self.syncing = syncing
         self.startup = startup
+
+        self.file_event_types = file_event_types
+        self.dir_event_types = dir_event_types
 
         self._ignored_events = []
         self.ignore_timeout = 2.0
@@ -308,8 +341,12 @@ class FSEventHandler(FileSystemEventHandler):
         if not (self.syncing.is_set() or self.startup.is_set()):
             return
 
-        # ignore all DirMovedEvents
-        if isinstance(event, DirModifiedEvent):
+        # handle only whitelisted dir event types
+        if event.is_directory and event.event_type not in self.dir_event_types:
+            return
+
+        # handle only whitelisted file event types
+        if not event.is_directory and event.event_type not in self.file_event_types:
             return
 
         # check if event should be ignored
@@ -402,13 +439,12 @@ class SyncEngine:
     _case_conversion_cache: LRUCache
 
     _max_history = 1000
-    _num_threads = min(32, _cpu_count * 3)
+    _num_threads = min(32, cpu_count * 3)
 
     def __init__(self, client: DropboxClient, fs_events_handler: FSEventHandler):
 
         self.client = client
         self.config_name = self.client.config_name
-        self.cancel_pending = Event()
         self.fs_events = fs_events_handler
 
         self.sync_lock = RLock()
@@ -417,7 +453,7 @@ class SyncEngine:
         self._conf = MaestralConfig(self.config_name)
         self._state = MaestralState(self.config_name)
 
-        self.notifier = MaestralDesktopNotifier(self.config_name)
+        self.notifier = notify.MaestralDesktopNotifier(self.config_name)
 
         # upload_errors / download_errors: contains failed uploads / downloads
         # (from sync errors) to retry later
@@ -440,6 +476,7 @@ class SyncEngine:
 
         # data structures for internal communication
         self.sync_errors = set()
+        self._cancel_requested = Event()
 
         # data structures for user information
         self.syncing = []
@@ -470,7 +507,7 @@ class SyncEngine:
         self._is_case_sensitive = is_fs_case_sensitive(get_home_dir())
         self._mignore_rules = self._load_mignore_rules_form_file()
         self._excluded_items = self._conf.get("main", "excluded_items")
-        self._max_cpu_percent = self._conf.get("sync", "max_cpu_percent") * _cpu_count
+        self._max_cpu_percent = self._conf.get("sync", "max_cpu_percent") * cpu_count
 
         # caches
         self._case_conversion_cache = LRUCache(capacity=5000)
@@ -566,7 +603,7 @@ class SyncEngine:
     def max_cpu_percent(self, percent: float) -> None:
         """Setter: max_cpu_percent."""
         self._max_cpu_percent = percent
-        self._conf.set("app", "max_cpu_percent", percent // _cpu_count)
+        self._conf.set("app", "max_cpu_percent", percent // cpu_count)
 
     # ==== sync state ==================================================================
 
@@ -959,7 +996,7 @@ class SyncEngine:
         """
         Checks if the Dropbox folder still exists where we expect it to be.
 
-        :raises DropboxDeletedError: When localal Dropbox directory does not exist.
+        :raises DropboxDeletedError: When local Dropbox directory does not exist.
         """
 
         if not osp.isdir(self.dropbox_path):
@@ -978,7 +1015,7 @@ class SyncEngine:
         """
 
         retries = 0
-        max_retries = 3
+        max_retries = 100
 
         while not osp.isdir(self.file_cache_path):
             try:
@@ -990,7 +1027,7 @@ class SyncEngine:
                 self.clean_cache_dir()
             except OSError as err:
                 raise CacheDirError(
-                    f"Cannot create cache directory (errno {err.errno})",
+                    f"Cannot create cache directory: {os.strerror(err.errno)}",
                     "Please check if you have write permissions for "
                     f"{self._file_cache_path}.",
                 )
@@ -1000,6 +1037,8 @@ class SyncEngine:
                     "Cannot create cache directory",
                     "Exceeded maximum number of retries",
                 )
+
+            retries += 1
 
     def clean_cache_dir(self) -> None:
         """Removes all items in the cache directory."""
@@ -1011,7 +1050,7 @@ class SyncEngine:
                 pass
             except OSError as err:
                 raise CacheDirError(
-                    f"Cannot clean cache directory (errno {err.errno})",
+                    f"Cannot create cache directory: {os.strerror(err.errno)}",
                     "Please check if you have write permissions for "
                     f"{self._file_cache_path}.",
                 )
@@ -1020,16 +1059,17 @@ class SyncEngine:
         """Returns a new temporary file name in our cache directory."""
         self._ensure_cache_dir_present()
         try:
-            with tempfile.NamedTemporaryFile(
-                dir=self.file_cache_path, delete=False
-            ) as f:
-                umask = os.umask(0o22)
-                os.umask(umask)
-                os.fchmod(f.fileno(), 0o666 & ~umask)
+            with NamedTemporaryFile(dir=self.file_cache_path, delete=False) as f:
+                try:
+                    os.chmod(f.fileno(), 0o666 & ~umask)
+                except OSError as exc:
+                    # Can occur on file system's that don't support POSIX permissions
+                    # such as NTFS mounted without the permissions option.
+                    logger.debug("Cannot set permissions: errno %s", exc.errno)
                 return f.name
         except OSError as err:
             raise CacheDirError(
-                f"Cannot create temporary file (errno {err.errno})",
+                f"Cannot create cache directory: {os.strerror(err.errno)}",
                 "Please check if you have write permissions for "
                 f"{self._file_cache_path}.",
             )
@@ -1280,6 +1320,19 @@ class SyncEngine:
             while cpu_usage > self._max_cpu_percent:
                 cpu_usage = cpu_usage_percent(0.5 + 2 * random.random())
 
+    def cancel_sync(self):
+        """
+        Cancels all pending sync jobs and returns when idle.
+        """
+
+        self._cancel_requested.set()
+
+        # Wait until we can acquire the sync lock => we are idle.
+        self.sync_lock.acquire()
+        self.sync_lock.release()
+
+        self._cancel_requested.clear()
+
     def busy(self) -> bool:
         """
         Checks if we are currently syncing.
@@ -1331,7 +1384,7 @@ class SyncEngine:
             self.notifier.notify(
                 "Sync error",
                 f"Could not sync {file_name}",
-                level=self.notifier.SYNCISSUE,
+                level=notify.SYNCISSUE,
                 buttons={"Show": callback},
             )
             self.sync_errors.add(err)
@@ -1353,7 +1406,8 @@ class SyncEngine:
             only logged.
         """
 
-        title = None
+        title = ""
+        msg = ""
         new_exc = None
 
         try:
@@ -1383,6 +1437,7 @@ class SyncEngine:
         if new_exc:
             if log_errors:
                 logger.error(title, exc_info=exc_info_tuple(new_exc))
+                self.notifier.notify(title, msg, level=notify.ERROR)
             else:
                 raise new_exc
 
@@ -1421,16 +1476,18 @@ class SyncEngine:
                 sync_events = [
                     SyncEvent.from_file_system_event(e, self) for e in events
                 ]
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 self.ensure_dropbox_folder_present()
                 return
 
             if len(events) > 0:
-                self.apply_local_changes(sync_events, local_cursor)
+                self.apply_local_changes(sync_events)
                 logger.debug("Uploaded local changes while inactive")
             else:
-                self.local_cursor = local_cursor
                 logger.debug("No local changes while inactive")
+
+            if not self._cancel_requested.is_set():
+                self.local_cursor = local_cursor
 
     def _get_local_changes_while_inactive(self) -> Tuple[List[FileSystemEvent], float]:
         """
@@ -1448,7 +1505,7 @@ class SyncEngine:
 
         changes = []
         snapshot_time = time.time()
-        snapshot = DirectorySnapshot(self.dropbox_path)
+        snapshot = self._dir_snapshot_with_mignore(self.dropbox_path)
         lowercase_snapshot_paths: Set[str] = set()
 
         # don't use iterator here but pre-fetch all entries
@@ -1468,14 +1525,13 @@ class SyncEngine:
                 # check if item was created or modified since last sync
                 # but before we started the FileEventHandler (~snapshot_time)
                 stats = snapshot.stat_info(path)
-                ctime_check = (
-                    snapshot_time > stats.st_ctime > self.get_last_sync(dbx_path_lower)
-                )
+                last_sync = self.get_last_sync(dbx_path_lower)
+                ctime_check = snapshot_time > stats.st_ctime > last_sync
 
                 # always upload untracked items, check ctime of tracked items
-                local_entry = self.get_index_entry(dbx_path_lower)
-                is_new = local_entry is None
-                is_modified = ctime_check and local_entry is not None
+                index_entry = self.get_index_entry(dbx_path_lower)
+                is_new = index_entry is None
+                is_modified = ctime_check and not is_new
 
                 if is_new:
                     if snapshot.isdir(path):
@@ -1485,10 +1541,10 @@ class SyncEngine:
                     changes.append(event)
 
                 elif is_modified:
-                    if snapshot.isdir(path) and local_entry.is_directory:  # type: ignore
+                    if snapshot.isdir(path) and index_entry.is_directory:  # type: ignore
                         event = DirModifiedEvent(path)
                         changes.append(event)
-                    elif not snapshot.isdir(path) and not local_entry.is_directory:  # type: ignore
+                    elif not snapshot.isdir(path) and not index_entry.is_directory:  # type: ignore
                         event = FileModifiedEvent(path)
                         changes.append(event)
                     elif snapshot.isdir(path):
@@ -1501,8 +1557,9 @@ class SyncEngine:
                         changes += [event0, event1]
 
         # get deleted items
+        dbx_root_lower = self.dropbox_path.lower()
         for entry in entries:
-            local_path_uncased = f"{self.dropbox_path}{entry.dbx_path_lower}".lower()
+            local_path_uncased = f"{dbx_root_lower}{entry.dbx_path_lower}"
             if local_path_uncased not in lowercase_snapshot_paths:
                 local_path = self.to_local_path_from_cased(entry.dbx_path_cased)
                 if entry.is_directory:
@@ -1519,26 +1576,53 @@ class SyncEngine:
 
         return changes, snapshot_time
 
-    def wait_for_local_changes(
-        self, timeout: float = 40, delay: float = 1
-    ) -> Tuple[List[SyncEvent], float]:
+    def wait_for_local_changes(self, timeout: float = 40) -> bool:
+
+        logger.debug("Waiting for local changes since cursor: %s", self.local_cursor)
+
+        try:
+            event = self.fs_events.local_file_event_queue.get(timeout=timeout)
+        except Empty:
+            return False
+
+        self.fs_events.local_file_event_queue.queue.append(event)
+        return True
+
+    def upload_sync_cycle(self):
+        """
+        Performs a full upload sync cycle by calling in order:
+
+            1) :meth:`list_local_changes`
+            2) :meth:`apply_local_changes`
+
+        Handles updating the local cursor for you. If monitoring for local file events
+        was interrupted, call :meth:`upload_local_changes_while_inactive` instead.
+        """
+
+        with self.sync_lock:
+
+            changes, cursor = self.list_local_changes()
+            self.apply_local_changes(changes)
+
+            if not self._cancel_requested.is_set():
+                # Save local cursor if not sync was not aborted by user.
+                # Failed uploads will be tracked and retried individually.
+                self.local_cursor = cursor
+
+            del changes
+            self.free_memory()
+
+    def list_local_changes(self, delay: float = 1) -> Tuple[List[SyncEvent], float]:
         """
         Waits for local file changes. Returns a list of local changes with at most one
         entry per path.
 
-        :param timeout: If no changes are detected within timeout (sec), an empty list
-            is returned.
         :param delay: Delay in sec to wait for subsequent changes before returning.
         :returns: (list of sync times events, time_stamp)
         """
 
-        self.ensure_dropbox_folder_present()
-
-        try:
-            events = [self.fs_events.local_file_event_queue.get(timeout=timeout)]
-            local_cursor = time.time()
-        except Empty:
-            return [], time.time()
+        events = []
+        local_cursor = time.time()
 
         # keep collecting events until idle for `delay`
         while True:
@@ -1556,84 +1640,74 @@ class SyncEngine:
 
         return sync_events, local_cursor
 
-    def apply_local_changes(
-        self, sync_events: List[SyncEvent], local_cursor: float
-    ) -> List[SyncEvent]:
+    def apply_local_changes(self, sync_events: List[SyncEvent]) -> List[SyncEvent]:
         """
         Applies locally detected changes to the remote Dropbox. Changes which should be
         ignored (mignore or always ignored files) are skipped.
 
         :param sync_events: List of local file system events.
-        :param local_cursor: Time stamp of last event in ``events``.
         """
 
-        with self.sync_lock:
+        results = []
 
-            results = []
+        if len(sync_events) > 0:
 
-            if len(sync_events) > 0:
+            sync_events, _ = self._filter_excluded_changes_local(sync_events)
 
-                sync_events, _ = self._filter_excluded_changes_local(sync_events)
+            deleted: List[SyncEvent] = []
+            dir_moved: List[SyncEvent] = []
+            other: List[SyncEvent] = []  # file created + moved, dir created
 
-                deleted: List[SyncEvent] = []
-                dir_moved: List[SyncEvent] = []
-                other: List[SyncEvent] = []  # file created + moved, dir created
+            for event in sync_events:
+                if event.is_deleted:
+                    deleted.append(event)
+                elif event.is_directory and event.is_moved:
+                    dir_moved.append(event)
+                else:
+                    other.append(event)
 
-                for event in sync_events:
-                    if event.is_deleted:
-                        deleted.append(event)
-                    elif event.is_directory and event.is_moved:
-                        dir_moved.append(event)
-                    else:
-                        other.append(event)
+                # housekeeping
+                self.syncing.append(event)
 
-                    # housekeeping
-                    self.syncing.append(event)
+            # apply deleted events first, folder moved events second
+            # neither event type requires an actual upload
+            if deleted:
+                logger.info("Uploading deletions...")
 
-                # apply deleted events first, folder moved events second
-                # neither event type requires an actual upload
-                if deleted:
-                    logger.info("Uploading deletions...")
+            with ThreadPoolExecutor(
+                max_workers=self._num_threads,
+                thread_name_prefix="maestral-upload-pool",
+            ) as executor:
+                res = executor.map(self._create_remote_entry, deleted)
 
-                with ThreadPoolExecutor(
-                    max_workers=self._num_threads,
-                    thread_name_prefix="maestral-upload-pool",
-                ) as executor:
-                    res = executor.map(self._create_remote_entry, deleted)
+                n_items = len(deleted)
+                for n, r in enumerate(res):
+                    throttled_log(logger, f"Deleting {n + 1}/{n_items}...")
+                    results.append(r)
 
-                    n_items = len(deleted)
-                    for n, r in enumerate(res):
-                        throttled_log(logger, f"Deleting {n + 1}/{n_items}...")
-                        results.append(r)
+            if dir_moved:
+                logger.info("Moving folders...")
 
-                if dir_moved:
-                    logger.info("Moving folders...")
+            for event in dir_moved:
+                logger.info(f"Moving {event.dbx_path_from}...")
+                res = self._create_remote_entry(event)
+                results.append(res)
 
-                for event in dir_moved:
-                    logger.info(f"Moving {event.dbx_path_from}...")
-                    res = self._create_remote_entry(event)
-                    results.append(res)
+            # apply other events in parallel since order does not matter
+            with ThreadPoolExecutor(
+                max_workers=self._num_threads,
+                thread_name_prefix="maestral-upload-pool",
+            ) as executor:
+                res = executor.map(self._create_remote_entry, other)
 
-                # apply other events in parallel since order does not matter
-                with ThreadPoolExecutor(
-                    max_workers=self._num_threads,
-                    thread_name_prefix="maestral-upload-pool",
-                ) as executor:
-                    res = executor.map(self._create_remote_entry, other)
+                n_items = len(other)
+                for n, r in enumerate(res):
+                    throttled_log(logger, f"Syncing ↑ {n + 1}/{n_items}")
+                    results.append(r)
 
-                    n_items = len(other)
-                    for n, r in enumerate(res):
-                        throttled_log(logger, f"Syncing ↑ {n + 1}/{n_items}")
-                        results.append(r)
+            self._clean_history()
 
-                self._clean_history()
-
-            if not self.cancel_pending.is_set():
-                # always save local cursor if not aborted by user,
-                # failed uploads will be tracked and retried individually
-                self.local_cursor = local_cursor
-
-            return results
+        return results
 
     def _filter_excluded_changes_local(
         self, sync_events: List[SyncEvent]
@@ -1966,7 +2040,7 @@ class SyncEngine:
         :returns: SyncEvent with updated status.
         """
 
-        if self.cancel_pending.is_set():
+        if self._cancel_requested.is_set():
             event.status = SyncStatus.Aborted
             self.syncing.remove(event)
             return event
@@ -2363,42 +2437,23 @@ class SyncEngine:
 
     # ==== Download sync ===============================================================
 
-    def get_remote_folder(self, dbx_path: str = "/") -> bool:
+    def get_remote_folder(self, dbx_path: str) -> bool:
         """
-        Gets all files/folders from Dropbox and writes them to the local folder
-        :attr:`dropbox_path`. Call this method on first run of the Maestral. Indexing
-        and downloading may take several minutes, depending on the size of the user's
-        Dropbox folder.
+        Gets all files/folders from a Dropbox folder and writes them to the local folder
+        :attr:`dropbox_path`.
 
-        :param dbx_path: Path relative to Dropbox folder. Defaults to root ('/').
+        :param dbx_path: Path relative to Dropbox folder.
         :returns: Whether download was successful.
         """
 
         with self.sync_lock:
 
-            dbx_path = dbx_path or "/"
-            is_dbx_root = dbx_path == "/"
-            success = True
-
-            if is_dbx_root:
-                logger.info("Fetching remote Dropbox")
-            else:
-                logger.info(f"Syncing ↓ {dbx_path}")
-
-            if any(is_child(folder, dbx_path) for folder in self.excluded_items):
-                # if there are excluded subfolders, index and download only included
-                skip_excluded = True
-            else:
-                skip_excluded = False
+            logger.info(f"Syncing ↓ {dbx_path}")
 
             try:
-                # get a cursor and list the folder content
-                cursor = self.client.get_latest_cursor(dbx_path)
 
                 # iterate over index and download results
-                list_iter = self.client.list_folder_iterator(
-                    dbx_path, recursive=not skip_excluded, include_deleted=False
-                )
+                list_iter = self.client.list_folder_iterator(dbx_path, recursive=True)
 
                 for res in list_iter:
                     res.entries.sort(key=lambda x: x.path_lower.count("/"))
@@ -2407,37 +2462,16 @@ class SyncEngine:
                     sync_events = [
                         SyncEvent.from_dbx_metadata(md, self) for md in res.entries
                     ]
-                    download_res = self.apply_remote_changes(sync_events, cursor=None)
+                    download_res = self.apply_remote_changes(sync_events)
 
-                    s = all(
+                    success = all(
                         e.status in (SyncStatus.Done, SyncStatus.Skipped)
                         for e in download_res
                     )
-                    success = s and success
-
-                    if skip_excluded:
-                        # list and download sub-folder contents if not excluded
-                        included_subfolders = [
-                            md
-                            for md in res.entries
-                            if isinstance(md, FolderMetadata)
-                            and not self.is_excluded_by_user(md.path_display)
-                        ]
-                        for md in included_subfolders:
-                            s = self.get_remote_folder(md.path_display)
-                            success = s and success
-
-                        del included_subfolders
 
             except SyncError as e:
                 self._handle_sync_error(e, direction=SyncDirection.Down)
                 return False
-
-            if is_dbx_root:
-                # always save remote cursor if this is the root folder,
-                # failed downloads will be tracked and retried individually
-                self.remote_cursor = cursor
-                self._state.set("sync", "last_reindex", time.time())
 
             return success
 
@@ -2482,63 +2516,82 @@ class SyncEngine:
 
             return success
 
-    def wait_for_remote_changes(
-        self, last_cursor: str, timeout: int = 40, delay: float = 2
-    ) -> bool:
+    def wait_for_remote_changes(self, last_cursor: str, timeout: int = 40) -> bool:
         """
         Blocks until changes to the remote Dropbox are available.
 
         :param last_cursor: Cursor form last sync.
         :param timeout: Timeout in seconds before returning even if there are no
             changes. Dropbox adds random jitter of up to 90 sec to this value.
-        :param delay: Delay in sec to wait for subsequent changes that may be
-            duplicates. This delay is typically only necessary folders are shared /
-            un-shared with other Dropbox accounts.
         """
         logger.debug("Waiting for remote changes since cursor:\n%s", last_cursor)
         has_changes = self.client.wait_for_remote_changes(last_cursor, timeout=timeout)
-        time.sleep(delay)
+
+        # For for 2 sec. This delay is typically only necessary folders are shared /
+        # un-shared with other Dropbox accounts.
+        time.sleep(2)
+
         logger.debug("Detected remote changes: %s", has_changes)
         return has_changes
 
-    def list_remote_changes(self, last_cursor: str) -> Tuple[List[SyncEvent], str]:
+    def download_sync_cycle(self) -> None:
         """
-        Lists remote changes since the last download sync.
+        Performs a full download sync cycle by calling in order:
 
-        :param last_cursor: Cursor from last download sync.
-        :returns: Tuple with remote changes and corresponding cursor
+            1) :meth:`list_remote_changes_iterator`
+            2) :meth:`apply_remote_changes`
+
+        Handles updating the remote cursor and resuming interrupted syncs for you.
+        Calling this method will perform a full indexing if this is the first download.
         """
-        logger.info("Fetching remote changes...")
 
-        changes = self.client.list_remote_changes(last_cursor)
-        logger.debug("Listed remote changes:\n%s", entries_repr(changes.entries))
+        with self.sync_lock:
 
-        clean_changes = self._clean_remote_changes(changes)
-        logger.debug("Cleaned remote changes:\n%s", entries_repr(clean_changes.entries))
+            is_indexing = self.remote_cursor == ""
 
-        clean_changes.entries.sort(key=lambda x: x.path_lower.count("/"))
-        sync_events = [
-            SyncEvent.from_dbx_metadata(md, self) for md in clean_changes.entries
-        ]
-        logger.debug("Converted remote changes to SyncEvents")
+            changes_iter = self.list_remote_changes_iterator(self.remote_cursor)
 
-        return sync_events, changes.cursor
+            # Download changes in chunks to reduce memory usage.
+            for changes, cursor in changes_iter:
+                downloaded = self.apply_remote_changes(changes)
+
+                if not is_indexing:
+                    # Don't send desktop notifications during indexing.
+                    self.notify_user(downloaded)
+
+                if self._cancel_requested.is_set():
+                    break
+                else:
+                    # Save (incremental) remote cursor.
+                    self.remote_cursor = cursor
+
+                del changes
+                del downloaded
+
+            self.free_memory()
 
     def list_remote_changes_iterator(
         self, last_cursor: str
-    ) -> Iterator[Tuple[List[SyncEvent], Optional[str]]]:
+    ) -> Iterator[Tuple[List[SyncEvent], str]]:
         """
-        Lists remote changes since the last download sync. Works the same as
-        :meth:`list_remote_changes` but returns an iterator over remote changes. Only
-        the last result will have a valid cursor which is not None.
+        Get remote changes since the last download sync, as specified by
+        ``last_cursor``. If the ``last_cursor`` is from paginating through a previous
+        set of changes, continue where we left off. If ``last_cursor`` is an emtpy
+        string, tart a full indexing of the Dropbox folder.
 
         :param last_cursor: Cursor from last download sync.
         :returns: Iterator yielding tuples with remote changes and corresponding cursor.
         """
 
-        logger.info("Fetching remote changes...")
-
-        changes_iter = self.client.list_remote_changes_iterator(last_cursor)
+        if last_cursor == "":
+            # We are starting from the beginning, do a full indexing.
+            logger.info("Fetching remote Dropbox")
+            changes_iter = self.client.list_folder_iterator("/", recursive=True)
+        else:
+            # Pick up where we left off. This may be an interrupted indexing /
+            # pagination through changes or a completely new set of changes.
+            logger.info("Fetching remote changes...")
+            changes_iter = self.client.list_remote_changes_iterator(last_cursor)
 
         for changes in changes_iter:
 
@@ -2556,12 +2609,9 @@ class SyncEngine:
 
             logger.debug("Converted remote changes to SyncEvents")
 
-            cursor = changes.cursor if not changes.has_more else None
-            yield sync_events, cursor
+            yield sync_events, changes.cursor
 
-    def apply_remote_changes(
-        self, sync_events: List[SyncEvent], cursor: Optional[str]
-    ) -> List[SyncEvent]:
+    def apply_remote_changes(self, sync_events: List[SyncEvent]) -> List[SyncEvent]:
         """
         Applies remote changes to local folder. Call this on the result of
         :meth:`list_remote_changes`. The saved cursor is updated after a set of changes
@@ -2569,9 +2619,6 @@ class SyncEngine:
         successful completion.
 
         :param sync_events: List of remote changes.
-        :param cursor: Remote cursor corresponding to changes. Take care to only pass
-            cursors which represent the state of the entire Dropbox. Pass None instead
-            if you are only downloading a subset of changes.
         :returns: List of changes that were made to local files and bool indicating if
             all download syncs were successful.
         """
@@ -2658,11 +2705,6 @@ class SyncEngine:
             for n, r in enumerate(res):
                 throttled_log(logger, f"Syncing ↓ {n + 1}/{n_items}")
                 results.append(r)
-
-        if cursor and not self.cancel_pending.is_set():
-            # always save remote cursor if not aborted by user,
-            # failed downloads will be tracked and retried individually
-            self.remote_cursor = cursor
 
         self._clean_history()
 
@@ -2853,7 +2895,7 @@ class SyncEngine:
 
         try:
             stat = os.stat(local_path)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             # don't check ctime for deleted items (os won't give stat info)
             # but confirm absence from index
             return index_entry is not None
@@ -2908,7 +2950,7 @@ class SyncEngine:
                 return ctime
             else:
                 return os.stat(local_path).st_ctime
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             return -1.0
 
     def _clean_remote_changes(
@@ -2982,7 +3024,7 @@ class SyncEngine:
             :class:`errors.SyncError` and ``None`` if cancelled.
         """
 
-        if self.cancel_pending.is_set():
+        if self._cancel_requested.is_set():
             event.status = SyncStatus.Aborted
             self.syncing.remove(event)
             return event
@@ -3211,7 +3253,7 @@ class SyncEngine:
             self.update_index_from_sync_event(event)
             logger.debug('Deleted local item "%s"', event.dbx_path)
             return event
-        elif isinstance(exc, FileNotFoundError):
+        elif isinstance(exc, (FileNotFoundError, NotADirectoryError)):
             self.update_index_from_sync_event(event)
             logger.debug('Deletion failed: "%s" not found', event.dbx_path)
             return None
@@ -3262,7 +3304,7 @@ class SyncEngine:
 
             # add created and deleted events of children as appropriate
 
-            snapshot = DirectorySnapshot(local_path)
+            snapshot = self._dir_snapshot_with_mignore(local_path)
             lowercase_snapshot_paths = {x.lower() for x in snapshot.paths}
             local_path_lower = local_path.lower()
 
@@ -3334,10 +3376,49 @@ class SyncEngine:
             # commit to drive
             self._db_session.commit()
 
+    def _scandir_with_mignore(self, path: str) -> List:
+        return [
+            f
+            for f in os.scandir(path)
+            if not self._is_mignore_path(self.to_dbx_path(f.path), f.is_dir())
+        ]
+
+    def _dir_snapshot_with_mignore(self, path: str) -> DirectorySnapshot:
+        return DirectorySnapshot(
+            path,
+            listdir=self._scandir_with_mignore,
+        )
+
 
 # ======================================================================================
 # Workers for upload, download and connection monitoring threads
 # ======================================================================================
+
+
+@contextmanager
+def handle_sync_thread_errors(
+    syncing: Event,
+    running: Event,
+    connected: Event,
+    notifier: notify.MaestralDesktopNotifier,
+) -> Iterator[None]:
+
+    try:
+        yield
+    except DropboxServerError:
+        logger.info("Dropbox server error", exc_info=True)
+    except ConnectionError:
+        syncing.clear()
+        connected.clear()
+        logger.debug("Connection error", exc_info=True)
+        logger.info(DISCONNECTED)
+    except Exception as err:
+        running.clear()
+        syncing.clear()
+        title = getattr(err, "title", "Unexpected error")
+        message = getattr(err, "message", "Please restart to continue syncing")
+        logger.error(title, exc_info=True)
+        notifier.notify(title, message, level=notify.ERROR)
 
 
 def download_worker(
@@ -3356,44 +3437,21 @@ def download_worker(
 
         syncing.wait()
 
-        try:
+        with handle_sync_thread_errors(syncing, running, connected, sync.notifier):
+
             has_changes = sync.wait_for_remote_changes(sync.remote_cursor)
 
-            with sync.sync_lock:
+            if not (running.is_set() and syncing.is_set()):
+                continue
 
-                if not (running.is_set() and syncing.is_set()):
-                    continue
+            sync.ensure_dropbox_folder_present()
 
-                if has_changes:
-                    logger.info(SYNCING)
+            if has_changes:
+                logger.info(SYNCING)
+                sync.download_sync_cycle()
+                logger.info(IDLE)
 
-                    changes_iter = sync.list_remote_changes_iterator(sync.remote_cursor)
-
-                    # download changes in chunks to reduce memory usage
-                    for changes, cursor in changes_iter:
-                        downloaded = sync.apply_remote_changes(changes, cursor)
-                        sync.notify_user(downloaded)
-
-                    sync.client.get_space_usage()  # update space usage
-                    logger.info(IDLE)
-
-                    # free memory
-                    del changes
-                    del downloaded
-                    sync.free_memory()
-
-        except DropboxServerError:
-            logger.info("Dropbox server error", exc_info=True)
-        except ConnectionError:
-            syncing.clear()
-            connected.clear()
-            logger.debug("Lost connection", exc_info=True)
-            logger.info(DISCONNECTED)
-        except Exception as err:
-            running.clear()
-            syncing.clear()
-            title = getattr(err, "title", "Unexpected error")
-            logger.error(title, exc_info=True)
+                sync.client.get_space_usage()  # update space usage
 
 
 def download_worker_added_item(
@@ -3418,7 +3476,8 @@ def download_worker_added_item(
 
         syncing.wait()
 
-        try:
+        with handle_sync_thread_errors(syncing, running, connected, sync.notifier):
+
             dbx_path = added_item_queue.get()
             sync.pending_downloads.add(dbx_path.lower())  # protect against crashes
 
@@ -3435,19 +3494,6 @@ def download_worker_added_item(
 
                 # free some memory
                 sync.free_memory()
-
-        except DropboxServerError:
-            logger.info("Dropbox server error", exc_info=True)
-        except ConnectionError:
-            syncing.clear()
-            connected.clear()
-            logger.debug("Lost connection", exc_info=True)
-            logger.info(DISCONNECTED)
-        except Exception as err:
-            running.clear()
-            syncing.clear()
-            title = getattr(err, "title", "Unexpected error")
-            logger.error(title, exc_info=True)
 
 
 def upload_worker(
@@ -3466,37 +3512,19 @@ def upload_worker(
 
         syncing.wait()
 
-        try:
-            changes, local_cursor = sync.wait_for_local_changes()
+        with handle_sync_thread_errors(syncing, running, connected, sync.notifier):
 
-            with sync.sync_lock:
-                if not (running.is_set() and syncing.is_set()):
-                    continue
+            has_changes = sync.wait_for_local_changes()
 
-                if len(changes) > 0:
-                    logger.info(SYNCING)
+            if not (running.is_set() and syncing.is_set()):
+                continue
 
-                sync.apply_local_changes(changes, local_cursor)
+            sync.ensure_dropbox_folder_present()
 
-                if len(changes) > 0:
-                    logger.info(IDLE)
-
-                # free some memory
-                del changes
-                sync.free_memory()
-
-        except DropboxServerError:
-            logger.info("Dropbox server error", exc_info=True)
-        except ConnectionError:
-            syncing.clear()
-            connected.clear()
-            logger.debug("Lost connection", exc_info=True)
-            logger.info(DISCONNECTED)
-        except Exception as err:
-            running.clear()
-            syncing.clear()
-            title = getattr(err, "title", "Unexpected error")
-            logger.error(title, exc_info=True)
+            if has_changes:
+                logger.info(SYNCING)
+                sync.upload_sync_cycle()
+                logger.info(IDLE)
 
 
 def startup_worker(
@@ -3522,78 +3550,46 @@ def startup_worker(
 
         startup.wait()
 
-        try:
-            with sync.sync_lock:
-                # run / resume initial download
-                # local changes during this download will be registered by the local
-                # FileSystemObserver but only uploaded after `syncing` has been set
-                if sync.remote_cursor == "":
-                    sync.clear_sync_errors()
-                    sync.get_remote_folder()
-                    sync.local_cursor = time.time()
+        with handle_sync_thread_errors(syncing, running, connected, sync.notifier):
 
-                if not running.is_set():
-                    continue
+            # Retry failed downloads.
+            if len(sync.download_errors) > 0:
+                logger.info("Retrying failed syncs...")
 
-                # retry failed downloads
-                if len(sync.download_errors) > 0:
-                    logger.info("Retrying failed syncs...")
+            for dbx_path in list(sync.download_errors):
+                logger.info(f"Syncing ↓ {dbx_path}")
+                sync.get_remote_item(dbx_path)
 
-                for dbx_path in list(sync.download_errors):
-                    logger.info(f"Syncing ↓ {dbx_path}")
-                    sync.get_remote_item(dbx_path)
+            # Resume interrupted downloads.
+            if len(sync.pending_downloads) > 0:
+                logger.info("Resuming interrupted syncs...")
 
-                # resume interrupted downloads
-                if len(sync.pending_downloads) > 0:
-                    logger.info("Resuming interrupted syncs...")
+            for dbx_path in list(sync.pending_downloads):
+                logger.info(f"Syncing ↓ {dbx_path}")
+                sync.get_remote_item(dbx_path)
+                sync.pending_downloads.discard(dbx_path)
 
-                for dbx_path in list(sync.pending_downloads):
-                    logger.info(f"Syncing ↓ {dbx_path}")
-                    sync.get_remote_item(dbx_path)
-                    sync.pending_downloads.discard(dbx_path)
+            # retry failed / interrupted uploads by scheduling additional events
+            # if len(sync.upload_errors) > 0:
+            #     logger.debug('Retrying failed uploads...')
+            #
+            # for dbx_path in list(sync.upload_errors):
+            #     sync.rescan(sync.to_local_path(dbx_path))
 
-                # retry failed / interrupted uploads by scheduling additional events
-                # if len(sync.upload_errors) > 0:
-                #     logger.debug('Retrying failed uploads...')
-                #
-                # for dbx_path in list(sync.upload_errors):
-                #     sync.rescan(sync.to_local_path(dbx_path))
+            sync.download_sync_cycle()
+            sync.upload_local_changes_while_inactive()
 
-                # upload changes while inactive
-                sync.upload_local_changes_while_inactive()
+            if not running.is_set():
+                continue
 
-                # enforce immediate check for remote changes
-                changes, remote_cursor = sync.list_remote_changes(sync.remote_cursor)
-                downloaded = sync.apply_remote_changes(changes, remote_cursor)
-                sync.notify_user(downloaded)
+            if not running.is_set():
+                continue
 
-                if not running.is_set():
-                    continue
+            if not paused_by_user.is_set():
+                syncing.set()
 
-                if not paused_by_user.is_set():
-                    syncing.set()
-
-                startup.clear()
-                logger.info(IDLE)
-
-                # free some memory
-                del changes
-                del downloaded
-                sync.free_memory()
-
-        except DropboxServerError:
-            logger.info("Dropbox server error", exc_info=True)
-        except ConnectionError:
-            syncing.clear()
-            connected.clear()
             startup.clear()
-            logger.debug("Lost connection", exc_info=True)
-            logger.info(DISCONNECTED)
-        except Exception as err:
-            running.clear()
-            syncing.clear()
-            title = getattr(err, "title", "Unexpected error")
-            logger.error(title, exc_info=True)
+            logger.info(IDLE)
 
 
 # ======================================================================================
@@ -3759,8 +3755,10 @@ class SyncMonitor:
             self.local_observer_thread.start()
         except OSError as err:
             new_err = fswatch_to_maestral_error(err)
-            title = getattr(new_err, "title", "Unexpected error")
-            logger.error(title, exc_info=exc_info_tuple(new_err))
+            title = getattr(err, "title", "Unexpected error")
+            message = getattr(err, "message", "Please restart to continue syncing")
+            logger.error(f"{title}: {message}", exc_info=exc_info_tuple(new_err))
+            self.sync.notifier.notify(title, message, level=notify.ERROR)
 
         self.running.set()
         self.syncing.clear()
@@ -3783,9 +3781,7 @@ class SyncMonitor:
         self.paused_by_user.set()
         self.syncing.clear()
 
-        self.sync.cancel_pending.set()
-        self._wait_for_idle()
-        self.sync.cancel_pending.clear()
+        self.sync.cancel_sync()
 
         logger.info(PAUSED)
 
@@ -3813,9 +3809,7 @@ class SyncMonitor:
         self.paused_by_user.clear()
         self.startup.clear()
 
-        self.sync.cancel_pending.set()
-        self._wait_for_idle()
-        self.sync.cancel_pending.clear()
+        self.sync.cancel_sync()
 
         self.local_observer_thread.stop()
         # self.local_observer_thread.join()
@@ -3831,6 +3825,7 @@ class SyncMonitor:
         """
 
         while True:
+
             if check_connection("www.dropbox.com"):
                 self.on_connect()
             else:
@@ -3892,11 +3887,6 @@ class SyncMonitor:
             self.start()
         else:
             self.resume()
-
-    def _wait_for_idle(self) -> None:
-
-        self.sync.sync_lock.acquire()
-        self.sync.sync_lock.release()
 
 
 # ======================================================================================
@@ -4017,7 +4007,7 @@ def cpu_usage_percent(interval: float = 0.1) -> float:
         raise ValueError(f"interval is not positive (got {interval!r})")
 
     def timer():
-        return time.monotonic() * _cpu_count
+        return time.monotonic() * cpu_count
 
     st1 = timer()
     rt1 = resource.getrusage(resource.RUSAGE_SELF)
@@ -4033,7 +4023,7 @@ def cpu_usage_percent(interval: float = 0.1) -> float:
     except ZeroDivisionError:
         return 0.0
     else:
-        single_cpu_percent = overall_cpus_percent * _cpu_count
+        single_cpu_percent = overall_cpus_percent * cpu_count
         return round(single_cpu_percent, 1)
 
 
@@ -4050,6 +4040,7 @@ def check_connection(hostname: str) -> bool:
         s.close()
         return True
     except Exception:
+        logger.debug("Connection error", exc_info=True)
         return False
 
 

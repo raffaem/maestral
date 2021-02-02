@@ -12,12 +12,28 @@ import logging.handlers
 import asyncio
 import random
 from concurrent.futures import ThreadPoolExecutor
-from typing import Union, List, Iterator, Dict, Set, Awaitable, Optional, Any
+from typing import (
+    Union,
+    List,
+    Iterator,
+    Dict,
+    Set,
+    Tuple,
+    Awaitable,
+    Optional,
+    Any,
+)
+import tempfile
+import mimetypes
+import difflib
 
 # external imports
 import requests
 from watchdog.events import DirDeletedEvent, FileDeletedEvent  # type: ignore
 from packaging.version import Version
+from datetime import datetime, timezone
+from dropbox.files import FileMetadata
+from dropbox.sharing import RequestedVisibility
 
 try:
     from systemd import journal  # type: ignore
@@ -35,9 +51,9 @@ from .errors import (
     NotFoundError,
     BusyError,
     KeyringAccessError,
+    UnsupportedFileTypeForDiff,
 )
 from .config import MaestralConfig, MaestralState, validate_config_name
-from .notify import MaestralDesktopNotificationHandler
 from .logging import CachedHandler, SdNotificationHandler, safe_journal_sender
 from .utils import get_newer_version
 from .utils.path import (
@@ -119,11 +135,9 @@ class Maestral:
         self._setup_logging()
 
         # set up sync infrastructure
-        self.client = DropboxClient(
-            config_name=self.config_name
-        )  # interface to Dbx SDK
-        self.monitor = SyncMonitor(self.client)  # coordinates sync threads
-        self.sync = self.monitor.sync  # provides core sync functionality
+        self.client = DropboxClient(config_name=self.config_name)
+        self.monitor = SyncMonitor(self.client)
+        self.sync = self.monitor.sync
 
         self._check_and_run_post_update_scripts()
 
@@ -276,11 +290,6 @@ class Maestral:
         self._log_handler_error_cache.setFormatter(log_fmt_short)
         self._log_handler_error_cache.setLevel(logging.ERROR)
         self._logger.addHandler(self._log_handler_error_cache)
-
-        # log errors to desktop notifications
-        self._log_handler_desktop_notifier = MaestralDesktopNotificationHandler()
-        self._log_handler_desktop_notifier.setLevel(logging.WARNING)
-        self._logger.addHandler(self._log_handler_desktop_notifier)
 
     # ==== methods to access config and saved state ====================================
 
@@ -815,6 +824,101 @@ class Maestral:
 
         return entries
 
+    def get_file_diff(self, old_rev: str, new_rev: Optional[str] = None) -> List[str]:
+        """
+        Compare to revisions of a text file using Python's difflib. The versions will be
+        downloaded to temporary files. If new_rev is None, the old revision will be
+        compared to the corresponding local file, if any.
+
+        :param old_rev: Identifier of old revision.
+        :param new_rev: Identifier of new revision.
+        :returns: Diff as a list of strings (lines).
+        :raises UnsupportedFileTypeForDiff: if file type is not supported.
+        :raises UnsupportedFileTypeForDiff: if file content could not be decoded.
+        :raises MaestralApiError: if file could not be read for any other reason.
+        """
+
+        def str_from_date(d: datetime) -> str:
+            """Convert 'client_modified' metadata to string in local timezone"""
+            tz_date = d.replace(tzinfo=timezone.utc).astimezone()
+            return tz_date.strftime("%d %b %Y at %H:%M")
+
+        def download_rev(rev: str) -> Tuple[List[str], FileMetadata]:
+            """
+            Download a rev to a tmp file, read it and return the content + metadata
+            """
+
+            with tempfile.NamedTemporaryFile(mode="w+") as f:
+                md = self.client.download(dbx_path, f.name, rev=rev)
+
+                # Read from the file
+                try:
+                    with convert_api_errors(dbx_path=dbx_path, local_path=f.name):
+                        content = f.readlines()
+                except UnicodeDecodeError:
+                    raise UnsupportedFileTypeForDiff(
+                        "Failed to decode the file",
+                        "Only UTF-8 plain text files are currently supported.",
+                    )
+
+            return content, md
+
+        md_new = self.client.get_metadata(f"rev:{new_rev}", include_deleted=True)
+        md_old = self.client.get_metadata(f"rev:{old_rev}", include_deleted=True)
+
+        if md_new is None or md_old is None:
+            missing_rev = new_rev if md_new is None else old_rev
+            raise NotFoundError(
+                f"Could not a file with revision {missing_rev}",
+                "Use 'list_revisions' to list past revisions of a file.",
+            )
+
+        dbx_path = self.sync.correct_case(md_old.path_display)
+        local_path = self.sync.to_local_path(md_old.path_display)
+
+        # Check if a diff is possible
+        # If mime is None, proceed because most files without
+        # an extension are just text files
+        mime, _ = mimetypes.guess_type(dbx_path)
+        if mime is not None and not mime.startswith("text/"):
+            raise UnsupportedFileTypeForDiff(
+                f"Bad file type: '{mime}'", "Only files of type 'text/*' are supported."
+            )
+
+        # If new_rev is None, the local file is used, even if it isn't synced
+        if new_rev is None:
+            new_rev = "local version"
+            try:
+                with convert_api_errors(dbx_path=dbx_path, local_path=local_path):
+                    mtime = time.localtime(osp.getmtime(local_path))
+                    date_str_new = time.strftime("%d %b %Y at %H:%M", mtime)
+
+                    with open(local_path) as f:
+                        content_new = f.readlines()
+
+            except UnicodeDecodeError:
+                raise UnsupportedFileTypeForDiff(
+                    "Failed to decode the file",
+                    "Only UTF-8 plain text files are currently supported.",
+                )
+        else:
+            content_new, md_new = download_rev(new_rev)
+            date_str_new = str_from_date(md_new.client_modified)
+
+        content_old, md_old = download_rev(old_rev)
+        date_str_old = str_from_date(md_old.client_modified)
+
+        return list(
+            difflib.unified_diff(
+                content_old,
+                content_new,
+                fromfile=f"{dbx_path} ({old_rev})",
+                tofile=f"{dbx_path} ({new_rev})",
+                fromfiledate=date_str_old,
+                tofiledate=date_str_new,
+            )
+        )
+
     def restore(self, dbx_path: str, rev: str) -> StoneType:
         """
         Restore an old revision of a file.
@@ -830,6 +934,8 @@ class Maestral:
         """
 
         self._check_linked()
+
+        logger.info(f"Restoring '{dbx_path} to {rev}'")
 
         res = self.client.restore(dbx_path, rev)
         return dropbox_stone_to_dict(res)
@@ -1193,6 +1299,87 @@ class Maestral:
         if resume:
             self.resume_sync()
 
+    def create_shared_link(
+        self,
+        dbx_path: str,
+        visibility: str = "public",
+        password: Optional[str] = None,
+        expires: Optional[float] = None,
+    ) -> StoneType:
+        """
+        Creates a shared link for the given ``dbx_path``. Returns a dictionary with
+        information regarding the link, including the URL, access permissions, expiry
+        time, etc. The shared link will grant read / download access only. Note that
+        basic accounts do not support password protection or expiry times.
+
+        :param dbx_path: Path to item on Dropbox.
+        :param visibility: Requested visibility of the shared link. Must be "public",
+            "team_only" or "password". The actual visibility may be different, depending
+            on the team and folder settings. Inspect the "link_permissions" entry of the
+            returned dictionary.
+        :param password: An optional password required to access the link. Will be
+            ignored if the visibility is not "password".
+        :param expires: An optional expiry time for the link as POSIX timestamp.
+        :returns: Shared link information as dict. See
+            :class:`dropbox.sharing.SharedLinkMetadata` for keys and values.
+        :raises ValueError: if visibility is 'password' but no password is provided.
+        :raises DropboxAuthError: in case of an invalid access token.
+        :raises DropboxServerError: for internal Dropbox errors.
+        :raises ConnectionError: if the connection to Dropbox fails.
+        :raises NotLinkedError: if no Dropbox account is linked.
+        """
+
+        self._check_linked()
+
+        if visibility not in ("public", "team_only", "password"):
+            raise ValueError("Visibility must be 'public', 'team_only', or 'password'")
+
+        if visibility == "password" and not password:
+            raise ValueError("Please specify a password")
+
+        link_info = self.client.create_shared_link(
+            dbx_path=dbx_path,
+            visibility=RequestedVisibility(visibility),
+            password=password,
+            expires=datetime.utcfromtimestamp(expires) if expires else None,
+        )
+
+        return dropbox_stone_to_dict(link_info)
+
+    def revoke_shared_link(self, url: str) -> None:
+        """
+        Revokes the given shared link. Note that any other links to the same file or
+        folder will remain valid.
+
+        :param url: URL of shared link to revoke.
+        :raises DropboxAuthError: in case of an invalid access token.
+        :raises DropboxServerError: for internal Dropbox errors.
+        :raises ConnectionError: if the connection to Dropbox fails.
+        :raises NotLinkedError: if no Dropbox account is linked.
+        """
+
+        self._check_linked()
+        self.client.revoke_shared_link(url)
+
+    def list_shared_links(self, dbx_path: Optional[str] = None) -> List[StoneType]:
+        """
+        Returns a list of all shared links for the given Dropbox path. If no path is
+        given, return all shared links for the account, up to a maximum of 1,000 links.
+
+        :param dbx_path: Path to item on Dropbox.
+        :returns: List of shared link information as dictionaries. See
+            :class:`dropbox.sharing.SharedLinkMetadata` for keys and values.
+        :raises DropboxAuthError: in case of an invalid access token.
+        :raises DropboxServerError: for internal Dropbox errors.
+        :raises ConnectionError: if the connection to Dropbox fails.
+        :raises NotLinkedError: if no Dropbox account is linked.
+        """
+
+        self._check_linked()
+        res = self.client.list_shared_links(dbx_path)
+
+        return [dropbox_stone_to_dict(link) for link in res.links]
+
     # ==== utility methods for front ends ==============================================
 
     def to_local_path(self, dbx_path: str) -> str:
@@ -1312,6 +1499,8 @@ class Maestral:
             self._update_from_pre_v1_2_0()
         elif Version(updated_from) < Version("1.2.1"):
             self._update_from_pre_v1_2_1()
+        elif Version(updated_from) < Version("1.3.2"):
+            self._update_from_pre_v1_3_2()
 
         self.set_state("app", "updated_scripts_completed", __version__)
 
@@ -1365,6 +1554,12 @@ class Maestral:
                             }
 
                         batch_op.drop_constraint(constraint_name=name, type_="unique")
+
+    def _update_from_pre_v1_3_2(self) -> None:
+
+        if self._conf.get("app", "keyring") == "keyring.backends.OS_X.Keyring":
+            logger.info("Migrating keyring after update from pre v1.3.2")
+            self._conf.set("app", "keyring", "keyring.backends.macOS.Keyring")
 
     # ==== period async jobs ===========================================================
 

@@ -2,18 +2,20 @@
 
 import os
 import os.path as osp
+import shutil
+import requests
 
 import pytest
 
-from maestral.errors import NotFoundError
+from maestral.errors import NotFoundError, UnsupportedFileTypeForDiff, SharedLinkError
 from maestral.main import FileStatus, IDLE
 from maestral.main import logger as maestral_logger
 from maestral.utils.path import delete
 
-from .conftest import wait_for_idle
+from .conftest import wait_for_idle, resources
 
 
-if not os.environ.get("DROPBOX_TOKEN"):
+if not ("DROPBOX_ACCESS_TOKEN" in os.environ or "DROPBOX_REFRESH_TOKEN" in os.environ):
     pytest.skip("Requires auth token", allow_module_level=True)
 
 
@@ -207,6 +209,47 @@ def test_selective_sync_api_nested(m):
     assert not m.fatal_errors
 
 
+def test_create_file_diff(m):
+    """Tests file diffs for supported and unsupported files."""
+
+    def write_and_get_rev(dbx_path, content, o="w"):
+        """
+        Open the dbx_path locally and write the content to the string.
+        If it should append something, you can set 'o = "a"'.
+        """
+
+        local_path = m.to_local_path(dbx_path)
+        with open(local_path, o) as f:
+            f.write(content)
+        wait_for_idle(m)
+        return m.client.get_metadata(dbx_path).rev
+
+    dbx_path_success = "/sync_tests/file.txt"
+    dbx_path_fail_pdf = "/sync_tests/diff.pdf"
+    dbx_path_fail_ext = "/sync_tests/bin.txt"
+
+    with pytest.raises(UnsupportedFileTypeForDiff):
+        # Write some dummy stuff to create two revs
+        old_rev = write_and_get_rev(dbx_path_fail_pdf, "old")
+        new_rev = write_and_get_rev(dbx_path_fail_pdf, "new")
+        m.get_file_diff(old_rev, new_rev)
+
+    with pytest.raises(UnsupportedFileTypeForDiff):
+        # Add a compiled helloworld c file with .txt extension
+        shutil.copy(resources + "/bin.txt", m.test_folder_local)
+        wait_for_idle(m)
+        old_rev = m.client.get_metadata(dbx_path_fail_ext).rev
+        # Just some bytes
+        new_rev = write_and_get_rev(dbx_path_fail_ext, "hi".encode(), o="ab")
+        m.get_file_diff(old_rev, new_rev)
+
+    old_rev = write_and_get_rev(dbx_path_success, "old")
+    new_rev = write_and_get_rev(dbx_path_success, "new")
+    # If this does not raise an error,
+    # the function should have been successful
+    _ = m.get_file_diff(old_rev, new_rev)
+
+
 def test_restore(m):
     """Tests restoring an old revision"""
 
@@ -247,3 +290,63 @@ def test_restore_failed(m):
 
     with pytest.raises(NotFoundError):
         m.restore("/sync_tests/restored-file", "015982ea314dac40000000154e40990")
+
+
+def test_sharedlink_lifecycle(m):
+
+    # create a folder to share
+    dbx_path = "/sync_tests/shared_folder"
+    m.client.make_dir(dbx_path)
+
+    # test creating a shared link
+    link_data = m.create_shared_link(dbx_path)
+
+    resp = requests.get(link_data["url"])
+    assert resp.status_code == 200
+
+    links = m.list_shared_links(dbx_path)
+    assert link_data in links
+
+    # test revoking a shared link
+    m.revoke_shared_link(link_data["url"])
+    links = m.list_shared_links(dbx_path)
+    assert link_data not in links
+
+
+def test_sharedlink_errors(m):
+
+    dbx_path = "/sync_tests/shared_folder"
+    m.client.make_dir(dbx_path)
+
+    # test creating a shared link with password, no password provided
+    with pytest.raises(ValueError):
+        m.create_shared_link(dbx_path, visibility="password")
+
+    # test creating a shared link with password fails on basic account
+    account_info = m.get_account_info()
+
+    if account_info["account_type"][".tag"] == "basic":
+        with pytest.raises(SharedLinkError):
+            m.create_shared_link(dbx_path, visibility="password", password="secret")
+
+    # test creating a shared link with the same settings as an existing link
+    m.create_shared_link(dbx_path)
+
+    with pytest.raises(SharedLinkError):
+        m.create_shared_link(dbx_path)
+
+    # test creating a shared link with an invalid path
+    with pytest.raises(NotFoundError):
+        m.create_shared_link("/this_is_not_a_file.txt")
+
+    # test listing shared links for an invalid path
+    with pytest.raises(NotFoundError):
+        m.list_shared_links("/this_is_not_a_file.txt")
+
+    # test revoking a non existent link
+    with pytest.raises(NotFoundError):
+        m.revoke_shared_link("https://www.dropbox.com/sh/48r2qxq748jfk5x/AAAS-niuW")
+
+    # test revoking a malformed link
+    with pytest.raises(SharedLinkError):
+        m.revoke_shared_link("https://www.testlink.de")

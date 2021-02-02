@@ -11,17 +11,15 @@ import time
 import signal
 import enum
 import subprocess
-import traceback
 import threading
 import fcntl
 import struct
 import tempfile
 import logging
 import warnings
-import faulthandler
 from shlex import quote
 from typing import Optional, Any, Union, Tuple, Dict, Iterable, Type, TYPE_CHECKING
-from types import TracebackType, FrameType
+from types import TracebackType
 
 # external imports
 import Pyro5  # type: ignore
@@ -80,7 +78,7 @@ else:
     EXECUTABLE = [sys.executable, "-OO"]
 
 
-def set_executable(executable: str, *argv) -> None:
+def set_executable(executable: str, *argv: str) -> None:
     """
     Sets the path of the Python executable to use when starting the daemon. By default
     :obj:`sys.executable` is used. Can be used when embedding the daemon.
@@ -302,10 +300,6 @@ class Lock:
 # ==== helpers for daemon management ===================================================
 
 
-def _sigterm_handler(signal_number: int, frame: FrameType) -> None:
-    sys.exit()
-
-
 def _send_term(pid: int) -> None:
     try:
         os.kill(pid, signal.SIGTERM)
@@ -413,9 +407,8 @@ def start_maestral_daemon(
     :raises RuntimeError: if a daemon for the given ``config_name`` is already running.
     """
 
-    faulthandler.register(signal.SIGTERM, file=sys.stderr, chain=True)
-
     import asyncio
+    from . import notify
     from .main import Maestral
 
     if log_to_stdout:
@@ -435,9 +428,6 @@ def start_maestral_daemon(
     # Nice ourselves to give other processes priority. We will likely only
     # have significant CPU usage in case of many concurrent downloads.
     os.nice(10)
-
-    # catch sigterm and shut down gracefully
-    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     # integrate with CFRunLoop in macOS, only works in main thread
     if sys.platform == "darwin":
@@ -523,8 +513,14 @@ def start_maestral_daemon(
     maestral_daemon = ExposedMaestral(config_name, log_to_stdout=log_to_stdout)
 
     if start_sync:
-        logger.debug("Starting sync")
-        maestral_daemon.start_sync()
+
+        try:
+            maestral_daemon.start_sync()
+        except Exception as exc:
+            title = getattr(exc, "title", "Failed to start sync")
+            message = getattr(exc, "message", "Please inspect the logs")
+            logger.error(title, exc_info=True)
+            maestral_daemon.sync.notify(title, message, level=notify.ERROR)
 
     try:
 
@@ -541,6 +537,11 @@ def start_maestral_daemon(
             for socket in daemon.sockets:
                 loop.add_reader(socket.fileno(), daemon.events, daemon.sockets)
 
+            # handle sigterm gracefully
+            signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+            for s in signals:
+                loop.add_signal_handler(s, maestral_daemon.shutdown_daemon)
+
             loop.run_until_complete(maestral_daemon.shutdown_complete)
 
             for socket in daemon.sockets:
@@ -549,8 +550,8 @@ def start_maestral_daemon(
             # prevent housekeeping from blocking shutdown
             daemon.transportServer.housekeeper = None
 
-    except Exception:
-        traceback.print_exc()
+    except Exception as exc:
+        logger.error(exc.args[0], exc_info=True)
     finally:
 
         if NOTIFY_SOCKET:
